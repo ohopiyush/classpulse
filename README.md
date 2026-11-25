@@ -8,6 +8,16 @@ Developed as a B.Tech. Micro Project in the **Department of Electronics Engineer
 
 ---
 
+## Screenshots
+
+### Main Dashboard & Calendar Picker
+![ClassPulse Dashboard](dashboard.png)
+
+### 7-Day Attendance Trend Analytics
+![ClassPulse Analytics](analytics.png)
+
+---
+
 ## Key Features
 
 * **Dual-Mode Cloud & Offline Persistence:** Synchronizes live with **Firebase Realtime Database** via REST APIs using a 15-second in-memory snapshot cache for zero UI lag, while automatically falling back to local **SQLite** (`WAL` mode) when offline.
@@ -23,11 +33,13 @@ Developed as a B.Tech. Micro Project in the **Department of Electronics Engineer
 ## Project Structure
 
 ```text
-ClassPulse/
+classpulse/
 ├── attendance_system.py   # Main Tkinter GUI, CalendarPopup, RollCallDialog, & Analytics
 ├── attendance_db.py       # Dual-mode Firebase RTDB (cached) & SQLite persistence layer
-├── classpulse.ico         # Custom application icon (optional)
+├── classpulse.ico         # Custom application icon
 ├── sample_roster.csv      # Sample CSV template (Roll No, Student Name)
+├── dashboard.png          # Application dashboard screenshot
+├── analytics.png          # 7-day trend analytics screenshot
 └── README.md              # Project documentation
 ```
 
@@ -37,8 +49,8 @@ ClassPulse/
 
 ### 1. Clone the Repository
 ```bash
-git clone [https://github.com/your-username/ClassPulse.git](https://github.com/your-username/ClassPulse.git)
-cd ClassPulse
+git clone [https://github.com/ohopiyush/classpulse.git](https://github.com/ohopiyush/classpulse.git)
+cd classpulse
 ```
 
 ### 2. Create a Virtual Environment & Install Dependencies
@@ -49,14 +61,12 @@ python -m venv .venv
 pip install requests pyinstaller
 ```
 
-### 3. Configure Firebase Realtime Database (Optional)
-ClassPulse runs immediately in **Local Mode** (`classpulse.db`) with zero configuration. To enable **Cloud Synced** mode:
-1. Create a **Realtime Database** in the [Firebase Console](https://console.firebase.google.com/) in test mode.
-2. Copy your database URL (e.g., `https://your-project-id-default-rtdb.asia-southeast1.firebasedatabase.app`).
-3. Open `attendance_db.py` and update `FIREBASE_URL` on line 34:
-   ```python
-   FIREBASE_URL = "[https://your-project-id-default-rtdb.asia-southeast1.firebasedatabase.app](https://your-project-id-default-rtdb.asia-southeast1.firebasedatabase.app)"
-   ```
+### 3. Firebase Realtime Database Configuration
+ClassPulse is pre-configured to sync with the project's Firebase Realtime Database instance (`FIREBASE_URL` in `attendance_db.py`) and automatically falls back to local SQLite (`classpulse.db`) when offline:
+
+```python
+FIREBASE_URL = "[https://classpulse-attendance-24f4e-default-rtdb.asia-southeast1.firebasedatabase.app](https://classpulse-attendance-24f4e-default-rtdb.asia-southeast1.firebasedatabase.app)"
+```
 
 ### 4. Run the Application
 ```bash
@@ -92,7 +102,7 @@ The compiled executable will be generated at `dist/ClassPulse.exe`.
 
 ## Authors
 
-* **Piyush Ojha** — Enrollment No.: `BTEL26O1083`
+* **Piyush Ojha** ([@ohopiyush](https://github.com/ohopiyush)) — Enrollment No.: `BTEL26O1083`
 * **Rahul Tyagi** — Enrollment No.: `BTEL26O1095`
 
 **Department of Electronics Engineering**  
