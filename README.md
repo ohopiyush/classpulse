@@ -1,3 +1,5 @@
+![LOGO](classpulse.png)
+
 # ClassPulse — Smart Student Attendance & Analytics System
 
 A lightweight, cloud-connected Windows desktop application built with Python (`tkinter`/`ttk`), **Firebase Realtime Database**, and **SQLite** to streamline classroom attendance tracking, automate `<75%` eligibility alerts, and generate real-time visual analytics.
