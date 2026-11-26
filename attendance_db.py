@@ -5,8 +5,10 @@ for ClassPulse — Smart Student Attendance & Analytics.
 import csv
 import json
 import os
+import queue
 import re
 import sqlite3
+import threading
 import time
 from datetime import date, timedelta
 
@@ -52,14 +54,19 @@ class AttendanceDB:
         self.conn = None
         self._cache_data: dict | None = None
         self._cache_ts: float = 0.0
+        self._cache_lock = threading.Lock()
+        self._session = requests.Session() if requests is not None else None
+        self._sync_queue: queue.Queue = queue.Queue()
+        self._pending_writes: int = 0
 
         if self.cloud_enabled:
             try:
-                resp = requests.get(f"{self.base_url}/.json", timeout=6)
+                resp = self._session.get(f"{self.base_url}/.json", timeout=6)
                 resp.raise_for_status()
                 self._cache_data = resp.json() or {}
                 self._cache_ts = time.monotonic()
                 self.cloud_online = True
+                threading.Thread(target=self._sync_worker, daemon=True).start()
             except Exception:
                 self.cloud_enabled = False
                 self.cloud_online = False
@@ -98,14 +105,40 @@ class AttendanceDB:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_att_roll ON attendance(roll_no);")
 
     # --------------------------------------------------------- cloud helpers
+    def _sync_worker(self):
+        """Sequential background worker that pushes optimistic writes to Firebase."""
+        while True:
+            item = self._sync_queue.get()
+            if item is None:
+                self._sync_queue.task_done()
+                break
+            method, path, payload = item
+            url = f"{self.base_url}/{path.lstrip('/')}.json"
+            try:
+                resp = self._session.request(method, url, json=payload, timeout=8)
+                resp.raise_for_status()
+                self.cloud_online = True
+            except Exception:
+                self.cloud_online = False
+            finally:
+                with self._cache_lock:
+                    self._pending_writes = max(0, self._pending_writes - 1)
+                    self._cache_ts = time.monotonic()
+                self._sync_queue.task_done()
+
+    def _enqueue_write(self, method: str, path: str, payload=None):
+        """Queues a Firebase write in the background without blocking the UI."""
+        with self._cache_lock:
+            self._pending_writes += 1
+            self._cache_ts = time.monotonic()
+        self._sync_queue.put((method, path, payload))
+
     def _req(self, method: str, path: str, payload=None):
         url = f"{self.base_url}/{path.lstrip('/')}.json"
         try:
-            resp = requests.request(method, url, json=payload, timeout=8)
+            resp = self._session.request(method, url, json=payload, timeout=8)
             resp.raise_for_status()
             self.cloud_online = True
-            if method != "GET":
-                self._cache_data = None
             return resp.json()
         except Exception as e:
             self.cloud_online = False
@@ -113,10 +146,22 @@ class AttendanceDB:
 
     def _cloud_snapshot(self, force_refresh: bool = False) -> dict:
         now = time.monotonic()
-        if force_refresh or self._cache_data is None or (now - self._cache_ts) > 15.0:
-            self._cache_data = self._req("GET", "") or {}
-            self._cache_ts = now
-        return self._cache_data
+        with self._cache_lock:
+            has_pending = self._pending_writes > 0
+            if (
+                not force_refresh
+                and self._cache_data is not None
+                and (has_pending or (now - self._cache_ts) <= 30.0)
+            ):
+                return self._cache_data
+
+        data = self._req("GET", "") or {}
+        with self._cache_lock:
+            # Avoid overwriting optimistic changes if a write was queued mid-fetch
+            if self._pending_writes == 0 or self._cache_data is None:
+                self._cache_data = data
+                self._cache_ts = time.monotonic()
+            return self._cache_data
 
     # ------------------------------------------------------------- validation
     def _clean_roll(self, roll: str) -> str:
@@ -141,10 +186,13 @@ class AttendanceDB:
         name = self._clean_name(name)
         if self.cloud_enabled:
             snap = self._cloud_snapshot()
-            students = snap.get("students") or {}
-            if roll in students:
-                raise DuplicateStudentError(f"Roll number '{roll}' is already registered.")
-            self._req("PUT", f"students/{roll}", {"roll_no": roll, "name": name, "created_at": date.today().isoformat()})
+            with self._cache_lock:
+                students = snap.setdefault("students", {})
+                if roll in students:
+                    raise DuplicateStudentError(f"Roll number '{roll}' is already registered.")
+                record = {"roll_no": roll, "name": name, "created_at": date.today().isoformat()}
+                students[roll] = record
+            self._enqueue_write("PUT", f"students/{roll}", record)
             return roll, name
 
         try:
@@ -159,11 +207,13 @@ class AttendanceDB:
         new_name = self._clean_name(new_name)
         if self.cloud_enabled:
             snap = self._cloud_snapshot()
-            students = snap.get("students") or {}
-            if roll not in students:
-                raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
-            old_name = students[roll].get("name", "")
-            self._req("PATCH", f"students/{roll}", {"name": new_name})
+            with self._cache_lock:
+                students = snap.get("students") or {}
+                if roll not in students:
+                    raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
+                old_name = students[roll].get("name", "")
+                students[roll]["name"] = new_name
+            self._enqueue_write("PATCH", f"students/{roll}", {"name": new_name})
             return roll, old_name, new_name
 
         cur = self.conn.execute("SELECT name FROM students WHERE roll_no = ?;", (roll,))
@@ -204,14 +254,20 @@ class AttendanceDB:
         roll = self._clean_roll(roll)
         if self.cloud_enabled:
             snap = self._cloud_snapshot()
-            students = snap.get("students") or {}
-            if roll not in students:
-                raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
-            self._req("DELETE", f"students/{roll}")
-            all_att = snap.get("attendance") or {}
-            for iso_day, recs in all_att.items():
-                if isinstance(recs, dict) and roll in recs:
-                    self._req("DELETE", f"attendance/{iso_day}/{roll}")
+            days_to_delete = []
+            with self._cache_lock:
+                students = snap.get("students") or {}
+                if roll not in students:
+                    raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
+                del students[roll]
+                all_att = snap.get("attendance") or {}
+                for iso_day, recs in all_att.items():
+                    if isinstance(recs, dict) and roll in recs:
+                        del recs[roll]
+                        days_to_delete.append(iso_day)
+            self._enqueue_write("DELETE", f"students/{roll}")
+            for iso_day in days_to_delete:
+                self._enqueue_write("DELETE", f"attendance/{iso_day}/{roll}")
             return
 
         with self.conn:
@@ -236,7 +292,12 @@ class AttendanceDB:
         roll = self._clean_roll(roll)
         iso_day = target_date.isoformat()
         if self.cloud_enabled:
-            self._req("DELETE", f"attendance/{iso_day}/{roll}")
+            snap = self._cloud_snapshot()
+            with self._cache_lock:
+                day_recs = (snap.get("attendance") or {}).get(iso_day)
+                if isinstance(day_recs, dict):
+                    day_recs.pop(roll, None)
+            self._enqueue_write("DELETE", f"attendance/{iso_day}/{roll}")
             return
         with self.conn:
             self.conn.execute("DELETE FROM attendance WHERE roll_no = ? AND att_date = ?;", (roll, iso_day))
@@ -250,13 +311,21 @@ class AttendanceDB:
 
         if self.cloud_enabled:
             snap = self._cloud_snapshot()
-            students = snap.get("students") or {}
-            if roll not in students:
-                raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
-            day_recs = (snap.get("attendance") or {}).get(iso_day) or {}
-            prev = day_recs.get(roll)
-            self._req("PUT", f"attendance/{iso_day}/{roll}", status)
-            return students[roll]["roll_no"], students[roll]["name"], prev
+            with self._cache_lock:
+                students = snap.get("students") or {}
+                if roll not in students:
+                    raise StudentNotFoundError(f"No student found with roll number '{roll}'.")
+                all_att = snap.setdefault("attendance", {})
+                day_recs = all_att.get(iso_day)
+                if not isinstance(day_recs, dict):
+                    day_recs = {}
+                    all_att[iso_day] = day_recs
+                prev = day_recs.get(roll)
+                day_recs[roll] = status
+                r_no = students[roll]["roll_no"]
+                name = students[roll]["name"]
+            self._enqueue_write("PUT", f"attendance/{iso_day}/{roll}", status)
+            return r_no, name, prev
 
         st = self.conn.execute("SELECT roll_no, name FROM students WHERE roll_no = ?;", (roll,)).fetchone()
         if not st:
@@ -290,11 +359,18 @@ class AttendanceDB:
         iso_day = target_date.isoformat()
         if self.cloud_enabled:
             snap = self._cloud_snapshot()
-            students = snap.get("students") or {}
-            day_recs = (snap.get("attendance") or {}).get(iso_day) or {}
-            affected = [r for r in students if r not in day_recs]
+            with self._cache_lock:
+                students = snap.get("students") or {}
+                all_att = snap.setdefault("attendance", {})
+                day_recs = all_att.get(iso_day)
+                if not isinstance(day_recs, dict):
+                    day_recs = {}
+                    all_att[iso_day] = day_recs
+                affected = [r for r in students if r not in day_recs]
+                for r in affected:
+                    day_recs[r] = "Absent"
             if affected:
-                self._req("PATCH", f"attendance/{iso_day}", {r: "Absent" for r in affected})
+                self._enqueue_write("PATCH", f"attendance/{iso_day}", {r: "Absent" for r in affected})
             return affected
 
         rows = self.conn.execute(
@@ -567,29 +643,32 @@ class AttendanceDB:
         added = 0
         skipped = 0
         if self.cloud_enabled:
-            snap = self._cloud_snapshot(force_refresh=True)
-            existing = snap.get("students") or {}
+            snap = self._cloud_snapshot()
             batch = {}
-            with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
-                for idx, row in enumerate(csv.reader(f)):
-                    if len(row) < 2:
-                        continue
-                    r_raw, n_raw = row[0].strip(), row[1].strip()
-                    if idx == 0 and r_raw.lower() in ("roll", "roll_no", "roll no", "roll number"):
-                        continue
-                    try:
-                        roll = self._clean_roll(r_raw)
-                        name = self._clean_name(n_raw)
-                    except ValidationError:
-                        skipped += 1
-                        continue
-                    if roll in existing or roll in batch:
-                        skipped += 1
-                    else:
-                        batch[roll] = {"roll_no": roll, "name": name, "created_at": date.today().isoformat()}
-                        added += 1
+            with self._cache_lock:
+                existing = snap.setdefault("students", {})
+                with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
+                    for idx, row in enumerate(csv.reader(f)):
+                        if len(row) < 2:
+                            continue
+                        r_raw, n_raw = row[0].strip(), row[1].strip()
+                        if idx == 0 and r_raw.lower() in ("roll", "roll_no", "roll no", "roll number"):
+                            continue
+                        try:
+                            roll = self._clean_roll(r_raw)
+                            name = self._clean_name(n_raw)
+                        except ValidationError:
+                            skipped += 1
+                            continue
+                        if roll in existing or roll in batch:
+                            skipped += 1
+                        else:
+                            rec = {"roll_no": roll, "name": name, "created_at": date.today().isoformat()}
+                            batch[roll] = rec
+                            existing[roll] = rec
+                            added += 1
             if batch:
-                self._req("PATCH", "students", batch)
+                self._enqueue_write("PATCH", "students", batch)
             return added, skipped
 
         with open(csv_path, mode="r", encoding="utf-8-sig", newline="") as f:
@@ -629,7 +708,7 @@ class AttendanceDB:
 
     def backup_to(self, dest_path: str) -> None:
         if self.cloud_enabled:
-            snapshot = self._cloud_snapshot(force_refresh=True)
+            snapshot = self._cloud_snapshot()
             with open(dest_path, mode="w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2)
             return
@@ -637,5 +716,13 @@ class AttendanceDB:
             self.conn.backup(dest_conn)
 
     def close(self):
+        if self.cloud_enabled:
+            try:
+                self._sync_queue.join()
+                self._sync_queue.put(None)
+            except Exception:
+                pass
+        if self._session is not None:
+            self._session.close()
         if self.conn is not None:
             self.conn.close()
